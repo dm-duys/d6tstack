@@ -1,7 +1,7 @@
 numpy
 openpyxl
 xlrd
-pandas>=0.22.0
+pandas>=2.0.0
 sqlalchemy
 scipy
 pyarrow

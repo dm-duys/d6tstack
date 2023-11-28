@@ -15,14 +15,14 @@ import d6tcollect
 # csv
 #******************************************************************
 
-def csv_count_rows(fname):
+def csv_count_rows(fname, encoding='utf-8'):
     def blocks(files, size=65536):
         while True:
             b = files.read(size)
             if not b: break
             yield b
 
-    with open(fname) as f:
+    with open(fname, encoding=encoding) as f:
         nrows = sum(bl.count("\n") for bl in blocks(f))
 
     return nrows
@@ -39,9 +39,10 @@ class CSVSniffer(object, metaclass=d6tcollect.Collect):
 
     """
 
-    def __init__(self, fname, nlines = 10, delims=',;\t|'):
+    def __init__(self, fname, nlines = 10, delims=',;\t|', encoding='utf-8'):
         self.cfg_fname = fname
-        self.nrows = csv_count_rows(fname) # todo: check for file size, if large don't run this
+        self.encoding = encoding
+        self.nrows = csv_count_rows(fname, encoding) # todo: check for file size, if large don't run this
         self.cfg_nlines = min(nlines,self.nrows) # read_lines() doesn't check EOF # todo: check 1% of file up to a max
         self.cfg_delims_pool = delims
         self.delim = None # delim used for the file
@@ -51,7 +52,7 @@ class CSVSniffer(object, metaclass=d6tcollect.Collect):
 
     def read_nlines(self):
         # read top lines
-        fhandle = open(self.cfg_fname)
+        fhandle = open(self.cfg_fname, encoding=self.encoding)
         self.csv_lines = [fhandle.readline().rstrip() for _ in range(self.cfg_nlines)]
         fhandle.close()
 
@@ -155,9 +156,9 @@ class CSVSnifferList(object, metaclass=d6tcollect.Collect):
     """
 
 
-    def __init__(self, fname_list, nlines = 10, delims=',;\t|'):
+    def __init__(self, fname_list, nlines = 10, delims=',;\t|', encoding='utf-8'):
         self.cfg_fname_list = fname_list
-        self.sniffers = [CSVSniffer(fname, nlines, delims) for fname in fname_list]
+        self.sniffers = [CSVSniffer(fname, nlines, delims, encoding) for fname in fname_list]
 
     def get_all(self, fun_name, msg_error):
         val = []
@@ -183,8 +184,8 @@ class CSVSnifferList(object, metaclass=d6tcollect.Collect):
         # todo: propagate status of individual sniffers. instead of raising exception pass back status to get user input
 
 
-def sniff_settings_csv(fname_list):
-    sniff = CSVSnifferList(fname_list)
+def sniff_settings_csv(fname_list, encoding='utf-8'):
+    sniff = CSVSnifferList(fname_list, encoding=encoding)
     csv_sniff = {}
     csv_sniff['delim'] = sniff.get_delim()
     csv_sniff['skiprows'] = sniff.count_skiprows()

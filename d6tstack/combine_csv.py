@@ -564,8 +564,8 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
 
         """
 
-        if not 'psycopg2' in uri:
-            raise ValueError('need to use psycopg2 uri')
+        # if not 'psycopg2' in uri:
+        #     raise ValueError('need to use psycopg2 uri')
 
         self._combine_preview_available()
 
