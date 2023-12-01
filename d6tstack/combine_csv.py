@@ -1,7 +1,10 @@
 import numpy as np
 import pandas as pd
-pd.set_option('display.expand_frame_repr', False)
+
+
+pd.set_option("display.expand_frame_repr", False)
 from scipy.stats import mode
+from psycopg.types.numeric import FloatDumper
 import warnings
 import ntpath, pathlib
 import copy
@@ -9,8 +12,8 @@ import itertools
 import os
 
 import d6tcollect
-# d6tcollect.init(__name__)
 
+from .sniffer import sniff_settings_csv
 from .helpers import *
 from .utils import PrintLogger
 
@@ -18,29 +21,42 @@ from .utils import PrintLogger
 # ******************************************************************
 # helpers
 # ******************************************************************
-def _dfconact(df):
-    return pd.concat(itertools.chain.from_iterable(df), sort=False, copy=False, join='inner', ignore_index=True)
+def _dfconact(dfs):
+    return pd.concat(
+        itertools.chain.from_iterable(dfs),
+        sort=False,
+        copy=False,
+        join="inner",
+        ignore_index=True,
+    )
+    # return functools.reduce(
+    #     lambda left, right: pd.merge(left, right, how="outer", sort=False, copy=False),
+    #     itertools.chain.from_iterable(dfs),
+    # )
+
 
 def _direxists(fname, logger):
     fdir = os.path.dirname(fname)
     if fdir and not os.path.exists(fdir):
         if logger:
-            logger.send_log('creating ' + fdir, 'ok')
+            logger.send_log("creating " + fdir, "ok")
         os.makedirs(fdir)
     return True
+
 
 # ******************************************************************
 # combiner
 # ******************************************************************
 
+
 class CombinerCSV(object, metaclass=d6tcollect.Collect):
-    """    
+    """
     Core combiner class. Sniffs columns, generates preview, combines aka stacks to various output formats.
 
     Args:
         fname_list (list): file names, eg ['a.csv','b.csv']
         sep (string): CSV delimiter, see pandas.read_csv()
-        has_header (boolean): data has header row 
+        has_header (boolean): data has header row
         nrows_preview (int): number of rows in preview
         chunksize (int): number of rows to read into memory while processing, see pandas.read_csv()
         read_csv_params (dict): additional parameters to pass to pandas.read_csv()
@@ -51,12 +67,27 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         apply_after_read (function): function to apply after reading each file. needs to return a dataframe
         log (bool): send logs to logger
         logger (object): logger object with `send_log()`
+        auto_sniff (bool): automatically sniff columns on init
 
     """
 
-    def __init__(self, fname_list, sep=',', nrows_preview=3, chunksize=1e6, read_csv_params=None,
-                 columns_select=None, columns_select_common=False, columns_rename=None, add_filename=True,
-                 apply_after_read=None, log=True, logger=None):
+    def __init__(
+        self,
+        fname_list,
+        sep=",",
+        nrows_preview=3,
+        chunksize=1e6,
+        read_csv_params=None,
+        columns_select=None,
+        columns_select_common=False,
+        columns_rename=None,
+        add_filename=True,
+        apply_after_read=None,
+        apply_before_read=None,
+        log=True,
+        logger=None,
+        auto_sniff=False,
+    ):
         if not fname_list:
             raise ValueError("Filename list should not be empty")
         self.fname_list = np.sort(fname_list)
@@ -64,35 +95,60 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         self.read_csv_params = read_csv_params
         if not self.read_csv_params:
             self.read_csv_params = {}
-        if not 'sep' in self.read_csv_params:
-            self.read_csv_params['sep'] = sep
-        if not 'chunksize' in self.read_csv_params:
-            self.read_csv_params['chunksize'] = chunksize
+        if not "sep" in self.read_csv_params:
+            self.read_csv_params["sep"] = sep
+        if not "chunksize" in self.read_csv_params:
+            self.read_csv_params["chunksize"] = chunksize
         self.logger = logger
         if not logger and log:
             self.logger = PrintLogger()
         if not log:
             self.logger = None
-        self.sniff_results = None
         self.add_filename = add_filename
         self.columns_select = columns_select
         self.columns_select_common = columns_select_common
         if columns_select and columns_select_common:
-            warnings.warn('columns_select will override columns_select_common, pick either one')
+            warnings.warn(
+                "columns_select will override columns_select_common, pick either one"
+            )
         self.columns_rename = columns_rename
         self._columns_reindex = None
         self._columns_rename_dict = None
         self.apply_after_read = apply_after_read
+        self.apply_before_read = apply_before_read
 
         self.df_combine_preview = None
 
         if self.columns_select:
-            if max(collections.Counter(columns_select).values())>1:
-                raise ValueError('Duplicate entries in columns_select')
+            if max(collections.Counter(columns_select).values()) > 1:
+                raise ValueError("Duplicate entries in columns_select")
+
+        self.sniff_results = None
+        if auto_sniff:
+            self.sniff_columns()
+
+    # def _sniff_csv_file(self, fname):
+    #     return d6ts.sniffer.sniff_csv_file(fname, **self.read_csv_params)
 
     def _read_csv_yield(self, fname, read_csv_params):
+        read_csv_params = copy.deepcopy(read_csv_params)
         self._columns_reindex_available()
-        dfs = pd.read_csv(fname, **read_csv_params)
+
+        if metadata := self.sniff_results.get("metadata"):
+            read_csv_params["sep"] = metadata[fname]["delimiter"]
+
+        if self.apply_before_read:
+            fbuf = self.apply_before_read(fname, read_csv_params)
+            fbuf.seek(0)
+            try:
+                dfs = pd.read_csv(fbuf, **read_csv_params)
+            except Exception as e:
+                print(e)
+                print(fname)
+                print(fbuf.getvalue()[:1024])
+                raise e
+        else:
+            dfs = pd.read_csv(fname, **read_csv_params)
         for dfc in dfs:
             if self.columns_rename and self._columns_rename_dict[fname]:
                 dfc = dfc.rename(columns=self._columns_rename_dict[fname])
@@ -101,14 +157,18 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
             if self.apply_after_read:
                 dfc = self.apply_after_read(dfc)
             if self.add_filename:
-                dfc['filepath'] = fname
-                dfc['filename'] = ntpath.basename(fname)
+                fdf = pd.DataFrame(
+                    {"filepath": fname, "filename": ntpath.basename(fname)},
+                    index=dfc.index,
+                )
+                dfc = pd.concat([fdf, dfc], axis=1)
+                # dfc["filepath"] = fname
+                # dfc["filename"] = ntpath.basename(fname)
             yield dfc
 
     def sniff_columns(self):
-
         """
-        
+
         Checks column consistency by reading top nrows in all files. It checks both presence and order of columns in all files
 
         Returns:
@@ -123,12 +183,16 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         """
 
         if self.logger:
-            self.logger.send_log('sniffing columns', 'ok')
+            self.logger.send_log("sniffing columns", "ok")
 
         read_csv_params = copy.deepcopy(self.read_csv_params)
-        read_csv_params['dtype'] = str
-        read_csv_params['nrows'] = self.nrows_preview
-        read_csv_params['chunksize'] = None
+        read_csv_params["dtype"] = str
+        read_csv_params["nrows"] = self.nrows_preview
+        read_csv_params["chunksize"] = None
+
+        # from ..d6tstack.sniffer import sniff_csv_file
+
+        # sniffer = sniff_csv_file(self.fname_list, encoding=read_csv_params["encoding"])
 
         # read nrows of every file
         self.dfl_all = []
@@ -149,31 +213,43 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
             df_col_present[iFileName] = [iCol in iFileCol for iCol in col_all]
 
         df_col_present = pd.DataFrame(df_col_present, index=col_all).T
-        df_col_present.index.names = ['file_path']
+        df_col_present.index.names = ["file_path"]
 
         # find index in column list so can check order is correct
         df_col_idx = {}
         for iFileName, iFileCol in col_files.items():
-            df_col_idx[iFileName] = [iFileCol.index(iCol) if iCol in iFileCol else np.nan for iCol in col_all]
+            df_col_idx[iFileName] = [
+                iFileCol.index(iCol) if iCol in iFileCol else np.nan for iCol in col_all
+            ]
         df_col_idx = pd.DataFrame(df_col_idx, index=col_all).T
 
         # order columns by where they appear in file
-        m=mode(df_col_idx,axis=0)
-        df_col_pos = pd.DataFrame({'o':m[0][0],'c':m[1][0]},index=df_col_idx.columns)
-        df_col_pos = df_col_pos.sort_values(['o','c'])
-        df_col_pos['iscommon']=df_col_pos.index.isin(col_common)
-
+        m = mode(df_col_idx, axis=0)
+        df_col_pos = pd.DataFrame(
+            {"o": m[0][0], "c": m[1][0]}, index=df_col_idx.columns
+        )
+        df_col_pos = df_col_pos.sort_values(["o", "c"])
+        df_col_pos["iscommon"] = df_col_pos.index.isin(col_common)
 
         # reorder by position
         col_all = df_col_pos.index.values.tolist()
-        col_common = df_col_pos[df_col_pos['iscommon']].index.values.tolist()
-        col_unique = df_col_pos[~df_col_pos['iscommon']].index.values.tolist()
+        col_common = df_col_pos[df_col_pos["iscommon"]].index.values.tolist()
+        col_unique = df_col_pos[~df_col_pos["iscommon"]].index.values.tolist()
         df_col_present = df_col_present[col_all]
         df_col_idx = df_col_idx[col_all]
 
-        sniff_results = {'files_columns': col_files, 'columns_all': col_all, 'columns_common': col_common,
-                       'columns_unique': col_unique, 'is_all_equal': columns_all_equal(dfl_all_col),
-                       'df_columns_present': df_col_present, 'df_columns_order': df_col_idx}
+        sniff_results = {
+            "files_columns": col_files,
+            "columns_all": col_all,
+            "columns_common": col_common,
+            "columns_unique": col_unique,
+            "is_all_equal": columns_all_equal(dfl_all_col),
+            "df_columns_present": df_col_present,
+            "df_columns_order": df_col_idx,
+            "metadata": sniff_settings_csv(
+                self.fname_list, encoding=read_csv_params["encoding"]
+            ),
+        }
         self.sniff_results = sniff_results
 
         return sniff_results
@@ -195,7 +271,7 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
              bool: all columns are equal in all files?
         """
         self._sniff_available()
-        return self.sniff_results['is_all_equal']
+        return self.sniff_results["is_all_equal"]
 
     def is_column_present(self):
         """
@@ -205,7 +281,7 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
              dataframe: boolean values for column presence in each file
         """
         self._sniff_available()
-        return self.sniff_results['df_columns_present']
+        return self.sniff_results["df_columns_present"]
 
     def is_column_present_unique(self):
         """
@@ -215,7 +291,7 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
              dataframe: boolean values for column presence in each file
         """
         self._sniff_available()
-        return self.is_column_present()[self.sniff_results['columns_unique']]
+        return self.is_column_present()[self.sniff_results["columns_unique"]]
 
     def columns_unique(self):
         """
@@ -228,17 +304,17 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
 
     def is_column_present_common(self):
         """
-        Shows common columns by file        
+        Shows common columns by file
 
         Returns:
              dataframe: boolean values for column presence in each file
         """
         self._sniff_available()
-        return self.is_column_present()[self.sniff_results['columns_common']]
+        return self.is_column_present()[self.sniff_results["columns_common"]]
 
     def columns_common(self):
         """
-        Shows common columns by file        
+        Shows common columns by file
 
         Returns:
              dataframe: boolean values for column presence in each file
@@ -247,13 +323,13 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
 
     def columns(self):
         """
-        Shows columns by file        
+        Shows columns by file
 
         Returns:
              dict: filename, columns
         """
         self._sniff_available()
-        return self.sniff_results['files_columns']
+        return self.sniff_results["files_columns"]
 
     def head(self):
         """
@@ -263,44 +339,71 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
              dict: filename, dataframe
         """
         self._sniff_available()
-        return dict(zip(self.fname_list,self.dfl_all))
+        return dict(zip(self.fname_list, self.dfl_all))
 
     def _columns_reindex_prep(self):
-
         self._sniff_available()
-        self._columns_select_dict = {} # select columns by filename
-        self._columns_rename_dict = {} # rename columns by filename
+        self._columns_select_dict = {}  # select columns by filename
+        self._columns_rename_dict = {}  # rename columns by filename
 
         for fname in self.fname_list:
             if self.columns_rename:
                 columns_rename = self.columns_rename.copy()
                 # check no naming conflicts
-                columns_select2 = [columns_rename[k] if k in columns_rename.keys() else k for k in self.sniff_results['files_columns'][fname]]
+                columns_select2 = [
+                    columns_rename[k] if k in columns_rename.keys() else k
+                    for k in self.sniff_results["files_columns"][fname]
+                ]
                 df_rename_count = collections.Counter(columns_select2)
-                if df_rename_count and max(df_rename_count.values()) > 1:  # would the rename create naming conflict?
-                    warnings.warn('Renaming conflict: {}'.format([(k, v) for k, v in df_rename_count.items() if v > 1]),
-                                  UserWarning)
+                if (
+                    df_rename_count and max(df_rename_count.values()) > 1
+                ):  # would the rename create naming conflict?
+                    warnings.warn(
+                        "Renaming conflict: {}".format(
+                            [(k, v) for k, v in df_rename_count.items() if v > 1]
+                        ),
+                        UserWarning,
+                    )
                     while df_rename_count and max(df_rename_count.values()) > 1:
                         # remove key value pair causing conflict
-                        conflicting_keys = [i for i, j in df_rename_count.items() if j > 1]
-                        columns_rename = {k: v for k, v in columns_rename.items() if k in conflicting_keys}
-                        columns_select2 = [columns_rename[k] if k in columns_rename.keys() else k for k in
-                                           self.sniff_results['files_columns'][fname]]
+                        conflicting_keys = [
+                            i for i, j in df_rename_count.items() if j > 1
+                        ]
+                        columns_rename = {
+                            k: v
+                            for k, v in columns_rename.items()
+                            if k in conflicting_keys
+                        }
+                        columns_select2 = [
+                            columns_rename[k] if k in columns_rename.keys() else k
+                            for k in self.sniff_results["files_columns"][fname]
+                        ]
                         df_rename_count = collections.Counter(columns_select2)
 
                 # store rename by file. keep only renames for columns actually present in file
-                self._columns_rename_dict[fname] = dict((k,v) for k,v in columns_rename.items() if k in k in self.sniff_results['files_columns'][fname])
+                self._columns_rename_dict[fname] = dict(
+                    (k, v)
+                    for k, v in columns_rename.items()
+                    if k in k in self.sniff_results["files_columns"][fname]
+                )
 
         if self.columns_select:
             columns_select2 = self.columns_select.copy()
         else:
             if self.columns_select_common:
-                columns_select2 = self.sniff_results['columns_common'].copy()
+                columns_select2 = self.sniff_results["columns_common"].copy()
             else:
-                columns_select2 = self.sniff_results['columns_all'].copy()
+                columns_select2 = self.sniff_results["columns_all"].copy()
 
         if self.columns_rename:
-            columns_select2 = list(dict.fromkeys([columns_rename[k] if k in columns_rename.keys() else k for k in columns_select2]))  # set of columns after rename
+            columns_select2 = list(
+                dict.fromkeys(
+                    [
+                        columns_rename[k] if k in columns_rename.keys() else k
+                        for k in columns_select2
+                    ]
+                )
+            )  # set of columns after rename
         # store select by file
         self._columns_reindex = columns_select2
 
@@ -337,9 +440,12 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
             dataframe: combined dataframe
         """
         read_csv_params = copy.deepcopy(self.read_csv_params)
-        read_csv_params['nrows'] = self.nrows_preview
+        read_csv_params["nrows"] = self.nrows_preview
 
-        df = [[dfc for dfc in self._read_csv_yield(fname, read_csv_params)] for fname in self.fname_list]
+        df = [
+            [dfc for dfc in self._read_csv_yield(fname, read_csv_params)]
+            for fname in self.fname_list
+        ]
         df = _dfconact(df)
         self.df_combine_preview = df.copy()
         return df
@@ -355,7 +461,10 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         Returns:
             dataframe: combined data
         """
-        df = [[dfc for dfc in self._read_csv_yield(fname, self.read_csv_params)] for fname in self.fname_list]
+        df = [
+            [dfc for dfc in self._read_csv_yield(fname, self.read_csv_params)]
+            for fname in self.fname_list
+        ]
         df = _dfconact(df)
         return df
 
@@ -372,9 +481,9 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         return fpath_out
 
     def _to_csv_prep(self, write_params):
-        if 'index' not in write_params:
-            write_params['index'] = False
-        write_params.pop('header', None) # library handles
+        if "index" not in write_params:
+            write_params["index"] = False
+        write_params.pop("header", None)  # library handles
 
         self._combine_preview_available()
 
@@ -395,15 +504,19 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         write_params = self._to_csv_prep(write_params)
 
         fnamesout = []
-        for fname, dfg in dict(zip(self.fname_list,self.dfl_all)).items():
-            filename = f'{fname}-head.csv'
-            filename = filename if output_dir is None else str(pathlib.Path(output_dir)/filename)
+        for fname, dfg in dict(zip(self.fname_list, self.dfl_all)).items():
+            filename = f"{fname}-head.csv"
+            filename = (
+                filename
+                if output_dir is None
+                else str(pathlib.Path(output_dir) / filename)
+            )
             dfg.to_csv(filename, **write_params)
             fnamesout.append(filename)
 
         return fnamesout
 
-    def to_csv_align(self, output_dir=None, output_prefix='d6tstack-', write_params={}):
+    def to_csv_align(self, output_dir=None, output_prefix="d6tstack-", write_params={}):
         """
         Create cleaned versions of original files. Automatically runs out of core, using `self.chunksize`.
 
@@ -421,10 +534,10 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
 
         fnamesout = []
         for fname in self.fname_list:
-            filename = self._get_filepath_out(fname, output_dir, output_prefix, '.csv')
+            filename = self._get_filepath_out(fname, output_dir, output_prefix, ".csv")
             if self.logger:
-                self.logger.send_log('writing '+filename , 'ok')
-            fhandle = open(filename, 'w')
+                self.logger.send_log("writing " + filename, "ok")
+            fhandle = open(filename, "w")
             self.df_combine_preview[:0].to_csv(fhandle, **write_params)
             for dfc in self._read_csv_yield(fname, self.read_csv_params):
                 dfc.to_csv(fhandle, header=False, **write_params)
@@ -448,7 +561,7 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         write_params = self._to_csv_prep(write_params)
 
         assert _direxists(filename, self.logger)
-        fhandle = open(filename, 'w')
+        fhandle = open(filename, "w")
         self.df_combine_preview[:0].to_csv(fhandle, **write_params)
         for fname in self.fname_list:
             for dfc in self._read_csv_yield(fname, self.read_csv_params):
@@ -456,7 +569,31 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         fhandle.close()
         return filename
 
-    def to_parquet_align(self, output_dir=None, output_prefix='d6tstack-', write_params={}):
+    def to_csv_buffer_combine(self, write_params={}):
+        """
+        Combines all files to a single csv file. Automatically runs out of core, using `self.chunksize`.
+
+        Args:
+            write_params (dict): additional params to pass to `pandas.to_csv()`
+
+        Returns:
+            str: buffer for combined data
+        """
+        import io
+
+        # stream all chunks from all files to a single file
+        write_params = self._to_csv_prep(write_params)
+
+        fbuf = io.StringIO()
+        self.df_combine_preview[:0].to_csv(fbuf, **write_params)
+        for fname in self.fname_list:
+            for dfc in self._read_csv_yield(fname, self.read_csv_params):
+                dfc.to_csv(fbuf, header=False, **write_params)
+        return fbuf
+
+    def to_parquet_align(
+        self, output_dir=None, output_prefix="d6tstack-", write_params={}
+    ):
         """
         Same as `to_csv_align` but outputs parquet files
 
@@ -472,12 +609,17 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         fnamesout = []
         pqschema = pa.Table.from_pandas(self.df_combine_preview).schema
         for fname in self.fname_list:
-            filename = self._get_filepath_out(fname, output_dir, output_prefix, '.pq')
+            filename = self._get_filepath_out(fname, output_dir, output_prefix, ".pq")
             if self.logger:
-                self.logger.send_log('writing '+filename , 'ok')
+                self.logger.send_log("writing " + filename, "ok")
             pqwriter = pq.ParquetWriter(filename, pqschema)
             for dfc in self._read_csv_yield(fname, self.read_csv_params):
-                pqwriter.write_table(pa.Table.from_pandas(dfc.astype(self.df_combine_preview.dtypes), schema=pqschema),**write_params)
+                pqwriter.write_table(
+                    pa.Table.from_pandas(
+                        dfc.astype(self.df_combine_preview.dtypes), schema=pqschema
+                    ),
+                    **write_params,
+                )
             pqwriter.close()
             fnamesout.append(filename)
 
@@ -496,21 +638,33 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         import pyarrow.parquet as pq
 
         # todo: fix mixed data type writing. at least give a warning
-        pqwriter = pq.ParquetWriter(filename, pa.Table.from_pandas(self.df_combine_preview).schema)
+        pqwriter = pq.ParquetWriter(
+            filename, pa.Table.from_pandas(self.df_combine_preview).schema
+        )
         for fname in self.fname_list:
             for dfc in self._read_csv_yield(fname, self.read_csv_params):
-                pqwriter.write_table(pa.Table.from_pandas(dfc.astype(self.df_combine_preview.dtypes)),**write_params)
+                pqwriter.write_table(
+                    pa.Table.from_pandas(dfc.astype(self.df_combine_preview.dtypes)),
+                    **write_params,
+                )
         pqwriter.close()
         return filename
 
-    def to_sql_combine(self, uri, tablename, if_exists='fail', write_params=None, return_create_sql=False):
+    def to_sql_combine(
+        self,
+        uri,
+        tablename,
+        if_exists="fail",
+        write_params=None,
+        return_create_sql=False,
+    ):
         """
         Load all files into a sql table using sqlalchemy. Generic but slower than the optmized functions
 
         Args:
             uri (str): sqlalchemy database uri
             tablename (str): table to store data in
-            if_exists (str): {‘fail’, ‘replace’, ‘append’}, default ‘fail’. See `pandas.to_sql()` for details
+            if_exists (str): {`fail`, `replace`, `append`}, default `fail`. See `pandas.to_sql()` for details
             write_params (dict): additional params to pass to `pandas.to_sql()`
             return_create_sql (dict): show create sql statement for combined file schema. Doesn't run data load
 
@@ -520,14 +674,14 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         """
         if not write_params:
             write_params = {}
-        if 'if_exists' not in write_params:
-            write_params['if_exists'] = if_exists
-        if 'index' not in write_params:
-            write_params['index'] = False
+        if "if_exists" not in write_params:
+            write_params["if_exists"] = if_exists
+        if "index" not in write_params:
+            write_params["index"] = False
         self._combine_preview_available()
 
-        if 'mysql' in uri and not 'mysql+pymysql' in uri:
-            raise ValueError('need to use pymysql for mysql (pip install pymysql)')
+        if "mysql" in uri and not "mysql+pymysql" in uri:
+            raise ValueError("need to use pymysql for mysql (pip install pymysql)")
 
         import sqlalchemy
 
@@ -537,26 +691,66 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         dfhead = self.df_combine_preview.astype(self.df_combine_preview.dtypes)[:0]
 
         if return_create_sql:
-            return pd.io.sql.get_schema(dfhead, tablename).replace('"',"`")
+            return pd.io.sql.get_schema(dfhead, tablename).replace('"', "`")
 
         dfhead.to_sql(tablename, sql_engine, **write_params)
 
         # append data
-        write_params['if_exists'] = 'append'
+        write_params["if_exists"] = "append"
         for fname in self.fname_list:
             for dfc in self._read_csv_yield(fname, self.read_csv_params):
-                dfc.astype(self.df_combine_preview.dtypes).to_sql(tablename, sql_engine, **write_params)
+                dfc.astype(self.df_combine_preview.dtypes).to_sql(
+                    tablename, sql_engine, **write_params
+                )
 
         return True
 
-    def to_psql_combine(self, uri, table_name, if_exists='fail', sep=','):
+    def to_psql_combine_fast(self, uri, table_name, if_exists="fail", write_params={}):
+        """
+        Load all files into a sql table using native postgres COPY FROM.
+        First converts to csv and then uses COPY FROM. Chunks data load to reduce memory consumption
+
+        Args:
+            uri (str): postgres psycopg2 sqlalchemy database uri
+            table_name (str): table to store data in
+            if_exists (str): {`fail`, `replace`, `append`}, default `fail`. See `pandas.to_sql()` for details
+            write_params (dict): additional params to pass to `pandas.to_csv()`
+
+        Returns:
+            bool: True if loader finished
+        """
+
+        import sqlalchemy
+
+        self._combine_preview_available()
+
+        df = self.to_pandas()
+        df["lastUpdated"] = [pd.to_datetime("now")] * df.shape[0]
+
+        sql_engine = sqlalchemy.create_engine(uri)
+        sql_cnxn = sql_engine.raw_connection()
+        cursor = sql_cnxn.cursor()
+        df.iloc[:0].to_sql(
+            table_name.lower(), sql_engine, if_exists=if_exists, index=False
+        )
+
+        with cursor.copy(f"COPY {table_name.lower()} FROM STDIN") as copy:
+            for _, record in df.iterrows():
+                copy.write_row(record)
+
+        sql_cnxn.commit()
+        cursor.close()
+
+        return True
+
+    def to_psql_combine(self, uri, table_name, if_exists="fail", sep=","):
         """
         Load all files into a sql table using native postgres COPY FROM. Chunks data load to reduce memory consumption
 
         Args:
             uri (str): postgres psycopg2 sqlalchemy database uri
             table_name (str): table to store data in
-            if_exists (str): {‘fail’, ‘replace’, ‘append’}, default ‘fail’. See `pandas.to_sql()` for details
+            if_exists (str): {`fail`, `replace`, `append`}, default `fail`. See `pandas.to_sql()` for details
             sep (str): separator for temp file, eg ',' or '\t'
 
         Returns:
@@ -576,27 +770,33 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
         sql_cnxn = sql_engine.raw_connection()
         cursor = sql_cnxn.cursor()
 
-        self.df_combine_preview[:0].to_sql(table_name, sql_engine, if_exists=if_exists, index=False)
+        self.df_combine_preview[:0].to_sql(
+            table_name, sql_engine, if_exists=if_exists, index=False
+        )
 
         for fname in self.fname_list:
             for dfc in self._read_csv_yield(fname, self.read_csv_params):
                 fbuf = io.StringIO()
-                dfc.astype(self.df_combine_preview.dtypes).to_csv(fbuf, index=False, header=False, sep=sep)
+                dfc.astype(self.df_combine_preview.dtypes).to_csv(
+                    fbuf, index=False, header=False, sep=sep
+                )
                 fbuf.seek(0)
-                cursor.copy_from(fbuf, table_name, sep=sep, null='')
+                cursor.copy_from(fbuf, table_name, sep=sep, null="")
         sql_cnxn.commit()
         cursor.close()
 
         return True
 
-    def to_mysql_combine(self, uri, table_name, if_exists='fail', tmpfile='mysql.csv', sep=','):
+    def to_mysql_combine(
+        self, uri, table_name, if_exists="fail", tmpfile="mysql.csv", sep=","
+    ):
         """
         Load all files into a sql table using native postgres LOAD DATA LOCAL INFILE. Chunks data load to reduce memory consumption
 
         Args:
             uri (str): mysql mysqlconnector sqlalchemy database uri
             table_name (str): table to store data in
-            if_exists (str): {‘fail’, ‘replace’, ‘append’}, default ‘fail’. See `pandas.to_sql()` for details
+            if_exists (str): {`fail`, `replace`, `append`}, default `fail`. See `pandas.to_sql()` for details
             tmpfile (str): filename for temporary file to load from
             sep (str): separator for temp file, eg ',' or '\t'
 
@@ -604,8 +804,10 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
             bool: True if loader finished
 
         """
-        if not 'mysql+mysqlconnector' in uri:
-            raise ValueError('need to use mysql+mysqlconnector uri (pip install mysql-connector)')
+        if not "mysql+mysqlconnector" in uri:
+            raise ValueError(
+                "need to use mysql+mysqlconnector uri (pip install mysql-connector)"
+            )
 
         self._combine_preview_available()
 
@@ -613,21 +815,27 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
 
         sql_engine = sqlalchemy.create_engine(uri)
 
-        self.df_combine_preview[:0].to_sql(table_name, sql_engine, if_exists=if_exists, index=False)
+        self.df_combine_preview[:0].to_sql(
+            table_name, sql_engine, if_exists=if_exists, index=False
+        )
 
         if self.logger:
-            self.logger.send_log('creating ' + tmpfile, 'ok')
-        self.to_csv_combine(tmpfile, write_params={'na_rep':'\\N','sep':sep})
+            self.logger.send_log("creating " + tmpfile, "ok")
+        self.to_csv_combine(tmpfile, write_params={"na_rep": "\\N", "sep": sep})
         if self.logger:
-            self.logger.send_log('loading ' + tmpfile, 'ok')
-        sql_load = "LOAD DATA LOCAL INFILE '{}' INTO TABLE {} FIELDS TERMINATED BY '{}' IGNORE 1 LINES;".format(tmpfile, table_name, sep)
+            self.logger.send_log("loading " + tmpfile, "ok")
+        sql_load = "LOAD DATA LOCAL INFILE '{}' INTO TABLE {} FIELDS TERMINATED BY '{}' IGNORE 1 LINES;".format(
+            tmpfile, table_name, sep
+        )
         sql_engine.execute(sql_load)
 
         os.remove(tmpfile)
 
         return True
 
-    def to_mssql_combine(self, uri, table_name, schema_name=None, if_exists='fail', tmpfile='mysql.csv'):
+    def to_mssql_combine(
+        self, uri, table_name, schema_name=None, if_exists="fail", tmpfile="mysql.csv"
+    ):
         """
         Load all files into a sql table using native postgres LOAD DATA LOCAL INFILE. Chunks data load to reduce memory consumption
 
@@ -635,15 +843,17 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
             uri (str): mysql mysqlconnector sqlalchemy database uri
             table_name (str): table to store data in
             schema_name (str): name of schema to write to
-            if_exists (str): {‘fail’, ‘replace’, ‘append’}, default ‘fail’. See `pandas.to_sql()` for details
+            if_exists (str): {`fail`, `replace`, `append`}, default `fail`. See `pandas.to_sql()` for details
             tmpfile (str): filename for temporary file to load from
 
         Returns:
             bool: True if loader finished
 
         """
-        if not 'mssql+pymssql' in uri:
-            raise ValueError('need to use mssql+pymssql uri (conda install -c prometeia pymssql)')
+        if not "mssql+pymssql" in uri:
+            raise ValueError(
+                "need to use mssql+pymssql uri (conda install -c prometeia pymssql)"
+            )
 
         self._combine_preview_available()
 
@@ -651,20 +861,23 @@ class CombinerCSV(object, metaclass=d6tcollect.Collect):
 
         sql_engine = sqlalchemy.create_engine(uri)
 
-        self.df_combine_preview[:0].to_sql(table_name, sql_engine, schema=schema_name, if_exists=if_exists, index=False)
+        self.df_combine_preview[:0].to_sql(
+            table_name, sql_engine, schema=schema_name, if_exists=if_exists, index=False
+        )
 
         if self.logger:
-            self.logger.send_log('creating ' + tmpfile, 'ok')
-        self.to_csv_combine(tmpfile, write_params={'na_rep':'\\N'})
+            self.logger.send_log("creating " + tmpfile, "ok")
+        self.to_csv_combine(tmpfile, write_params={"na_rep": "\\N"})
         if self.logger:
-            self.logger.send_log('loading ' + tmpfile, 'ok')
+            self.logger.send_log("loading " + tmpfile, "ok")
         if schema_name is not None:
-            table_name = '{}.{}'.format(schema_name,table_name)
+            table_name = "{}.{}".format(schema_name, table_name)
         sql_load = "BULK INSERT {} FROM '{}';".format()(table_name, tmpfile)
         sql_engine.execute(sql_load)
 
         os.remove(tmpfile)
 
         return True
+
 
 # todo: ever need to rerun _available fct instead of using cache?

@@ -5,6 +5,6 @@ pandas>=2.0.0
 sqlalchemy
 scipy
 pyarrow
-psycopg2
+psycopg
 mysql-connector
 d6tcollect
